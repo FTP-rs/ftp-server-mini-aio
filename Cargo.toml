@@ -1,0 +1,8 @@
+[package]
+name = "ftp-server-mini-aio"
+version = "0.1.0"
+authors = ["Antoni Boucher <bouanto@zoho.com>"]
+
+[dependencies]
+mini = { git = "https://github.com/adgear/mini-rs" }
+time = "0.1.42"
