@@ -22,6 +22,7 @@ use mini::aio::handler::{
     Stream,
 };
 use mini::aio::net::{
+    ListenerMsg,
     TcpConnection,
     TcpConnectionNotify,
     TcpListener,
@@ -99,7 +100,7 @@ fn add_file_info(path: PathBuf, out: &mut Vec<u8>) {
                            path=path,
                            extra=extra);
     out.extend(file_str.as_bytes());
-    println!("==> {:?}", &file_str);
+    //println!("==> {:?}", &file_str);
 }
 
 fn invalid_path(path: &Path) -> bool {
@@ -215,7 +216,7 @@ impl TcpListenNotify for Listener {
     }
 
     fn connected(&mut self, _listener: &net::TcpListener) -> Box<TcpConnectionNotify> {
-        println!("Waiting another client...");
+        //println!("Waiting another client...");
         let client = Client::new(&self.server_root, &self.event_loop);
         let stream = self.event_loop.spawn(client);
         Box::new(ClientNotify::new(stream))
@@ -224,11 +225,13 @@ impl TcpListenNotify for Listener {
 
 struct Client {
     connection: Option<TcpConnection>,
+    current_cmd: Vec<u8>,
     cwd: PathBuf,
     data_connection: Option<TcpConnection>,
     data_port: Option<u16>,
     event_loop: Loop,
     is_admin: bool,
+    listener: Option<Stream<ListenerMsg>>,
     name: Option<String>,
     store_path: Option<PathBuf>,
     server_root: PathBuf,
@@ -240,11 +243,13 @@ impl Client {
     fn new(server_root: &PathBuf, event_loop: &Loop) -> Self {
         Self {
             connection: None,
+            current_cmd: vec![],
             cwd: PathBuf::from("/"),
             data_connection: None,
             data_port: None,
             event_loop: event_loop.clone(),
             is_admin: true,
+            listener: None,
             name: None,
             store_path: None,
             server_root: server_root.clone(),
@@ -298,7 +303,7 @@ impl Client {
     }
 
     fn handle_cmd(&mut self, command: Command, stream: &Stream<Msg>) -> Result<()> {
-        println!("Received command: {:?}", command);
+        //println!("Received command: {:?}", command);
         let connection = self.connection.as_ref().expect("Received without connection");
         if self.is_logged() {
             match command {
@@ -519,7 +524,7 @@ impl Client {
                     add_file_info(path, &mut out);
                 }
                 self.send_data(out)?;
-                println!("-> and done!");
+                //println!("-> and done!");
             }
             else {
                 let answer = Answer::new(ResultCode::InvalidParameterOrArgument, "No such file or directory");
@@ -548,9 +553,10 @@ impl Client {
             return Ok(());
         }
 
-        let (_listener, addr) = TcpListener::ip4(&mut self.event_loop, &format!("127.0.0.1:{}", port), DataListener::new(stream))?;
+        let (listener, addr) = TcpListener::ip4(&mut self.event_loop, &format!("127.0.0.1:{}", port), DataListener::new(stream))?;
+        self.listener = Some(listener);
         let port = addr.port();
-        println!("Waiting clients on port {}...", port);
+        //println!("Waiting clients on port {}...", port);
 
         let answer = Answer::new(ResultCode::EnteringPassiveMode, &format!("127,0,0,1,{},{}", port >> 8, port & 0xFF));
         connection.write(answer.to_bytes())?;
@@ -585,7 +591,7 @@ impl Client {
                     // TODO: send the file chunck by chunck if it is big (if needed).
                     file.read_to_end(&mut out)?;
                     self.send_data(out)?;
-                    println!("-> file transfer done!");
+                    //println!("-> file transfer done!");
                 } else {
                     let answer = Answer::new(ResultCode::LocalErrorInProcessing,
                                       &format!("\"{}\" doesn't exist", path.to_str()
@@ -641,7 +647,7 @@ impl Client {
 
     fn send_data(&self, data: Vec<u8>) -> Result<()> {
         if let Some(ref connection) = self.data_connection {
-            println!("Sent data: {}", String::from_utf8_lossy(&data));
+            //println!("Sent data: {}", String::from_utf8_lossy(&data));
             connection.write(data)?;
         }
         Ok(())
@@ -660,7 +666,7 @@ impl Handler for Client {
             Accepted(connection) => {
                 /*let address = format!("[address : {}]", connection.local_addr()); // TODO
                 println!("New client: {}", address);*/
-                println!("New client");
+                //println!("New client");
                 let answer = Answer::new(ResultCode::ServiceReadyForNewUser, "Welcome to this FTP server!");
                 connection.write(answer.to_bytes());
                 self.connection = Some(connection);
@@ -669,14 +675,17 @@ impl Handler for Client {
                 self.data_connection = Some(stream);
                 let connection = self.connection.as_ref().expect("Received without connection");
                 connection.unmute();
+                if let Some(listener) = self.listener.take() {
+                    listener.send(ListenerMsg::Dispose);
+                }
             },
             DataReceived(data) => {
                 if let Some(path) = self.store_path.take() {
                     let write_data = || -> io::Result<()> {
-                        println!("Writing to {:?}", path.to_str());
+                        //println!("Writing to {:?}", path.to_str());
                         let mut file = File::create(path)?;
                         file.write_all(&data)?;
-                        println!("-> file transfer done!");
+                        //println!("-> file transfer done!");
                         self.close_data_connection();
                         let answer = Answer::new(ResultCode::ClosingDataConnection, "Transfer done");
                         let connection = self.connection.as_ref().expect("Received without connection");
@@ -690,14 +699,25 @@ impl Handler for Client {
             },
             Received(data) => {
                 if let Some(index) = find_crlf(&data) {
-                    let line = &data[..index];
+                    let line =
+                        if self.current_cmd.is_empty() {
+                            data[..index].to_vec()
+                        }
+                        else {
+                            let mut line = mem::replace(&mut self.current_cmd, vec![]);
+                            line.extend(&data[..index]);
+                            line
+                        };
                     //data.split_to(2); // TODO: handle multiple commands in one message.
-                    if let Ok(command) = Command::new(line.to_vec()) {
+                    if let Ok(command) = Command::new(line) {
                         if let Err(error) = self.handle_cmd(command, stream) {
                             eprintln!("Error: {}", error);
                         }
                     }
                     // TODO: handle error.
+                }
+                else {
+                    self.current_cmd.extend(data);
                 }
             },
             TransferDone => {
